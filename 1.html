@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web CH341A/Serial Bin Editor</title>
+    <style>
+        :root {
+            --bg-color: #1e1e1e;
+            --text-color: #d4d4d4;
+            --accent-color: #007acc;
+            --hex-hover: #264f78;
+            --hex-change: #ce9178;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+
+        h2 { margin-top: 0; border-bottom: 1px solid #333; padding-bottom: 10px; }
+
+        .toolbar {
+            display: flex;
+            gap: 10px;
+            padding: 10px;
+            background: #252526;
+            border-radius: 5px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        button, input[type="file"]::file-selector-button {
+            background-color: #333;
+            color: white;
+            border: 1px solid #444;
+            padding: 8px 15px;
+            cursor: pointer;
+            border-radius: 3px;
+            transition: 0.2s;
+        }
+
+        button:hover, input[type="file"]::file-selector-button:hover {
+            background-color: #444;
+        }
+
+        button.primary {
+            background-color: var(--accent-color);
+            border-color: var(--accent-color);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .status-bar {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #888;
+        }
+
+        .hex-editor {
+            flex-grow: 1;
+            overflow-y: auto;
+            margin-top: 15px;
+            font-family: 'Courier New', Courier, monospace;
+            background-color: #000;
+            padding: 10px;
+            border: 1px solid #333;
+            white-space: pre;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+
+        .hex-row { display: flex; }
+        .addr { color: #569cd6; margin-right: 15px; user-select: none; }
+        .hex-bytes { margin-right: 15px; display: flex; gap: 5px; }
+        .byte { 
+            cursor: pointer; 
+            padding: 0 2px;
+        }
+        .byte:hover { background-color: var(--hex-hover); }
+        .byte.modified { color: var(--hex-change); font-weight: bold; }
+        .ascii { color: #6a9955; border-left: 1px solid #333; padding-left: 10px; }
+
+        /* Dialog for Baud Rate */
+        #baudRate { width: 80px; padding: 5px; background: #333; color: white; border: 1px solid #444; }
+    </style>
+</head>
+<body>
+
+    <h2>CH341A / Web Serial Bin Editor</h2>
+
+    <div class="toolbar">
+        <select id="baudRate">
+            <option value="9600">9600</option>
+            <option value="115200" selected>115200</option>
+            <option value="921600">921600</option>
+        </select>
+        <button id="btnConnect" class="primary">🔗 連接 COM 口</button>
+        <button id="btnDisconnect" disabled>❌ 斷開</button>
+        <div style="width: 1px; height: 20px; background: #444; margin: 0 10px;"></div>
+        <input type="file" id="fileInput" accept=".bin,.hex,.rom">
+        <button id="btnSaveBin">💾 下載 BIN</button>
+        <div style="width: 1px; height: 20px; background: #444; margin: 0 10px;"></div>
+        <button id="btnWriteSPI" disabled style="background-color: #b33e3e;">🔥 寫入設備 (Write)</button>
+    </div>
+
+    <div class="status-bar" id="status">狀態: 等待操作...</div>
+
+    <div class="hex-editor" id="hexView">
+        <div style="padding: 20px; color: #666; text-align: center;">
+            請導入 .bin 檔案或從 COM 口讀取數據...
+        </div>
+    </div>
+
+    <script>
+        // --- 全局變數 ---
+        let port;
+        let writer;
+        let reader;
+        let fileData = new Uint8Array(0);
+        let isConnected = false;
+
+        // --- DOM 元素 ---
+        const statusEl = document.getElementById('status');
+        const hexView = document.getElementById('hexView');
+        const btnConnect = document.getElementById('btnConnect');
+        const btnDisconnect = document.getElementById('btnDisconnect');
+        const btnWrite = document.getElementById('btnWriteSPI');
+        const btnSave = document.getElementById('btnSaveBin');
+
+        // --- Web Serial API 連接邏輯 ---
+        btnConnect.addEventListener('click', async () => {
+            if (!navigator.serial) {
+                alert("您的瀏覽器不支援 Web Serial API，請使用 Chrome 或 Edge。");
+                return;
+            }
+
+            try {
+                port = await navigator.serial.requestPort();
+                const baud = parseInt(document.getElementById('baudRate').value);
+                await port.open({ baudRate: baud });
+
+                isConnected = true;
+                updateUIState();
+                log("已連接 COM 口", "success");
+                
+                // 開始監聽數據 (如果設備會回傳數據)
+                readLoop();
+            } catch (err) {
+                console.error(err);
+                log("連接失敗: " + err.message, "error");
+            }
+        });
+
+        btnDisconnect.addEventListener('click', async () => {
+            if (port) {
+                try {
+                    // 關閉讀寫流邏輯較複雜，這裡做簡化處理，通常需要重新整理頁面徹底釋放
+                    await port.close(); 
+                } catch(e) { console.log(e); }
+                port = null;
+                isConnected = false;
+                updateUIState();
+                log("已斷開連接");
+            }
+        });
+
+        // --- 檔案讀取 (Read .bin) ---
+        document.getElementById('fileInput').addEventListener('change', async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const buffer = await file.arrayBuffer();
+            fileData = new Uint8Array(buffer);
+            log(`已加載檔案: ${file.name} (${fileData.length} bytes)`);
+            renderHex(fileData);
+        });
+
+        // --- 寫入設備 (Write Logic) ---
+        btnWrite.addEventListener('click', async () => {
+            if (!port || !writer) {
+                // 嘗試建立 writer
+                if (port && port.writable) {
+                    const textEncoder = new TextEncoderStream();
+                    const writableStreamClosed = textEncoder.readable.pipeTo(port.writable);
+                    writer = port.writable.getWriter();
+                } else {
+                    log("無法寫入：端口未開啟或不可寫", "error");
+                    return;
+                }
+            }
+
+            if (fileData.length === 0) {
+                alert("Buffer 為空，請先導入檔案。");
+                return;
+            }
+
+            if (!confirm(`確定要將 ${fileData.length} bytes 寫入 COM 口嗎？`)) return;
+
+            log("開始寫入...", "pending");
+            
+            try {
+                // 為了避免緩衝區溢出，通常需要分包發送 (例如每包 64 bytes)
+                const chunkSize = 64; 
+                for (let i = 0; i < fileData.length; i += chunkSize) {
+                    const chunk = fileData.slice(i, i + chunkSize);
+                    await writer.write(chunk);
+                    
+                    // 更新進度
+                    const percent = Math.round(((i + chunk.length) / fileData.length) * 100);
+                    statusEl.innerText = `寫入中... ${percent}%`;
+                    
+                    // 簡單延遲，讓設備有時間處理 (依據 Baudrate 調整)
+                    await new Promise(r => setTimeout(r, 10)); 
+                }
+                log("寫入完成！", "success");
+            } catch (err) {
+                log("寫入錯誤: " + err.message, "error");
+            } finally {
+                writer.releaseLock();
+                writer = null; // Reset writer to allow re-locking later
+            }
+        });
+
+        // --- 讀取循環 (監聽 COM 回傳) ---
+        async function readLoop() {
+            while (port.readable && isConnected) {
+                reader = port.readable.getReader();
+                try {
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        // 這裡可以處理從設備讀回來的數據
+                        // 目前僅在 console 顯示，可依需求加入 Buffer
+                        console.log("收到數據:", value);
+                    }
+                } catch (err) {
+                    console.error(err);
+                } finally {
+                    reader.releaseLock();
+                }
+            }
+        }
+
+        // --- Hex Editor 渲染與編輯邏輯 ---
+        function renderHex(data) {
+            hexView.innerHTML = '';
+            const frag = document.createDocumentFragment();
+            const bytesPerRow = 16;
+
+            for (let i = 0; i < data.length; i += bytesPerRow) {
+                const row = document.createElement('div');
+                row.className = 'hex-row';
+
+                // 地址
+                const addr = document.createElement('div');
+                addr.className = 'addr';
+                addr.textContent = i.toString(16).padStart(8, '0').toUpperCase();
+                row.appendChild(addr);
+
+                // Hex 數據
+                const hexDiv = document.createElement('div');
+                hexDiv.className = 'hex-bytes';
+                
+                let asciiStr = '';
+
+                for (let j = 0; j < bytesPerRow; j++) {
+                    if (i + j < data.length) {
+                        const val = data[i + j];
+                        const byteSpan = document.createElement('span');
+                        byteSpan.className = 'byte';
+                        byteSpan.textContent = val.toString(16).padStart(2, '0').toUpperCase();
+                        byteSpan.dataset.index = i + j;
+                        
+                        // 點擊編輯事件
+                        byteSpan.onclick = function() {
+                            const newHex = prompt(`編輯地址 0x${(i+j).toString(16)} (Hex):`, this.textContent);
+                            if (newHex !== null) {
+                                const parsed = parseInt(newHex, 16);
+                                if (!isNaN(parsed) && parsed >= 0 && parsed <= 255) {
+                                    fileData[i + j] = parsed; // 更新 Buffer
+                                    this.textContent = parsed.toString(16).padStart(2, '0').toUpperCase();
+                                    this.classList.add('modified');
+                                    updateAscii(i, bytesPerRow); // 更新右側 ASCII
+                                } else {
+                                    alert("無效的 Hex 值 (00-FF)");
+                                }
+                            }
+                        };
+
+                        hexDiv.appendChild(byteSpan);
+
+                        // ASCII 處理
+                        asciiStr += (val >= 32 && val <= 126) ? String.fromCharCode(val) : '.';
+                    }
+                }
+                row.appendChild(hexDiv);
+
+                // ASCII 視圖
+                const asciiDiv = document.createElement('div');
+                asciiDiv.className = 'ascii';
+                asciiDiv.id = `ascii-${i}`;
+                asciiDiv.textContent = asciiStr;
+                row.appendChild(asciiDiv);
+
+                frag.appendChild(row);
+
+                // 性能優化：如果檔案太大，這裡需要改為虛擬滾動 (Virtual Scroll)，目前限制顯示前 10KB 避免卡死
+                if (i > 10240) { 
+                    const limitMsg = document.createElement('div');
+                    limitMsg.textContent = "... (為確保效能，僅顯示前 10KB，但寫入時會寫入完整檔案)";
+                    limitMsg.style.padding = "10px";
+                    limitMsg.style.color = "yellow";
+                    frag.appendChild(limitMsg);
+                    break; 
+                }
+            }
+            hexView.appendChild(frag);
+        }
+
+        // 輔助：更新單行 ASCII
+        function updateAscii(rowIndex, bytesPerRow) {
+            const asciiEl = document.getElementById(`ascii-${rowIndex}`);
+            if (!asciiEl) return;
+            let str = '';
+            for (let j = 0; j < bytesPerRow; j++) {
+                if (rowIndex + j < fileData.length) {
+                    const val = fileData[rowIndex + j];
+                    str += (val >= 32 && val <= 126) ? String.fromCharCode(val) : '.';
+                }
+            }
+            asciiEl.textContent = str;
+        }
+
+        // --- 匯出功能 ---
+        btnSave.addEventListener('click', () => {
+            if (fileData.length === 0) return;
+            const blob = new Blob([fileData], { type: "application/octet-stream" });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = "edited_firmware.bin";
+            a.click();
+            URL.revokeObjectURL(url);
+        });
+
+        // --- 界面輔助 ---
+        function updateUIState() {
+            btnConnect.disabled = isConnected;
+            btnDisconnect.disabled = !isConnected;
+            btnWrite.disabled = !isConnected;
+            document.getElementById('baudRate').disabled = isConnected;
+        }
+
+        function log(msg, type="info") {
+            statusEl.innerText = msg;
+            statusEl.style.color = type === 'error' ? '#ff6b6b' : (type === 'success' ? '#51cf66' : '#888');
+        }
+
+    </script>
+</body>
+</html>
